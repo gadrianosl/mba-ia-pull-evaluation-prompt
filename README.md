@@ -334,3 +334,122 @@ python src/evaluate.py
 - **Não altere os datasets de avaliação** - apenas os prompts em `prompts/bug_to_user_story_v2.yml`
 - **Itere, itere, itere** - é normal precisar de 3-5 iterações para atingir 0.9 em todas as métricas
 - **Documente seu processo** - a jornada de otimização é tão importante quanto o resultado final
+
+---
+
+## Técnicas Aplicadas (Fase 2)
+
+### 1) Few-shot Learning (obrigatória)
+
+**Por que escolhi:** a avaliação compara a saída com uma referência de User Story; exemplos de entrada/saída melhoram consistência de formato e cobertura de conteúdo.
+
+**Como apliquei:** no `system_prompt` de `prompts/bug_to_user_story_v2.yml`, incluí 3 exemplos (simples, médio e complexo) com padrão de resposta esperado.
+
+### 2) Role Prompting
+
+**Por que escolhi:** definir uma persona de **Senior Product Manager + Business Analyst** melhora tom, objetividade e foco em valor de negócio.
+
+**Como apliquei:** a primeira instrução do prompt define explicitamente o papel e a responsabilidade de transformar bug reports em User Stories acionáveis.
+
+### 3) Skeleton of Thought
+
+**Por que escolhi:** estrutura em etapas reduz ambiguidades e aumenta clareza/precisão da saída final.
+
+**Como apliquei:** adicionei um processo interno em 5 passos (ator/impacto, extração de contexto, story, critérios testáveis, contexto técnico/tarefas para casos complexos).
+
+---
+
+## Resultados Finais
+
+> Link atualizado com o dashboard informado.
+
+- **Dashboard público LangSmith:** https://smith.langchain.com/o/65f6fc58-2463-4ccd-8c6e-fa4decbe771f/projects/p/44bfa535-a96d-4922-a371-515670300e11
+- **Screenshots das avaliações (>= 0.9):** adicionar em uma pasta (`docs/images`) e referenciar aqui
+- **Tracing detalhado (3 exemplos):** anexar links/snapshots das execuções
+
+### Tabela comparativa (v1 vs v2)
+
+| Prompt | Helpfulness | Correctness | F1-Score | Clarity | Precision | Status |
+|-------|-------------|-------------|----------|---------|-----------|--------|
+| bug_to_user_story_v1 | 0.xx | 0.xx | 0.xx | 0.xx | 0.xx | ❌ |
+| bug_to_user_story_v2 | 0.xx | 0.xx | 0.xx | 0.xx | 0.xx | ✅ |
+
+---
+
+## Como Executar
+
+### Pré-requisitos
+
+- Python 3.9+
+- Conta no LangSmith
+- API Key do Google AI Studio (Gemini)
+
+### 1) Ambiente virtual e dependências
+
+```bash
+python -m venv venv
+# Windows (PowerShell)
+venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+### 2) Configurar `.env`
+
+Crie `.env` com base em `.env.example` e configure:
+
+```dotenv
+LANGSMITH_API_KEY=seu_langsmith_api_key
+LANGSMITH_PROJECT=prompt-optimization-challenge
+USERNAME_LANGSMITH_HUB=seu_username
+
+LLM_PROVIDER=google
+LLM_MODEL=gemini-2.5-flash
+EVAL_MODEL=gemini-2.5-flash
+GOOGLE_API_KEY=sua_google_api_key
+```
+
+### 3) Pull do prompt inicial
+
+```bash
+python src/pull_prompts.py
+```
+
+### 4) Push do prompt otimizado
+
+```bash
+python src/push_prompts.py
+```
+
+### 5) Executar avaliação
+
+```bash
+python src/evaluate.py
+```
+
+### 5.1) Modo econômico para iteração rápida
+
+Rodar apenas 5 exemplos e métricas essenciais (F1 + Precision), com cache:
+
+```bash
+python src/evaluate.py --max-examples 5 --metrics f1,precision --judge-model gpt-4o-mini
+```
+
+Rodar apenas Clarity depois, reaproveitando cache:
+
+```bash
+python src/evaluate.py --max-examples 5 --metrics clarity --judge-model gpt-4o-mini
+```
+
+### 5.2) Rodada oficial final (completa)
+
+Executa todos os exemplos e todas as métricas base:
+
+```bash
+python src/evaluate.py --final-run --judge-model gpt-4o
+```
+
+### 6) Executar testes de validação
+
+```bash
+pytest tests/test_prompts.py -v
+```

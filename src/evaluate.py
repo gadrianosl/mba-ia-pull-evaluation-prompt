@@ -20,6 +20,9 @@ Configure o provider no arquivo .env através da variável LLM_PROVIDER.
 import os
 import sys
 import json
+import time
+import hashlib
+import argparse
 from typing import List, Dict, Any
 from pathlib import Path
 from dotenv import load_dotenv
@@ -30,6 +33,118 @@ from utils import check_env_vars, format_score, print_section_header, get_llm as
 from metrics import evaluate_f1_score, evaluate_clarity, evaluate_precision
 
 load_dotenv()
+
+_LAST_GEN_CALL_TS = 0.0
+
+
+def parse_args() -> argparse.Namespace:
+    """Parseia argumentos CLI para modo econômico/final de avaliação."""
+    parser = argparse.ArgumentParser(description="Avaliação de prompts com suporte a modo econômico")
+    parser.add_argument(
+        "--max-examples",
+        type=int,
+        default=int(os.getenv("EVAL_MAX_EXAMPLES", "0")),
+        help="Limita quantidade de exemplos (0 = todos)."
+    )
+    parser.add_argument(
+        "--metrics",
+        type=str,
+        default=os.getenv("EVAL_METRICS", "f1,clarity,precision"),
+        help="Métricas base para avaliar: f1,clarity,precision (ex: f1,precision)."
+    )
+    parser.add_argument(
+        "--cache-file",
+        type=str,
+        default=os.getenv("EVAL_CACHE_FILE", ".cache/eval_cache.json"),
+        help="Arquivo de cache de resultados por exemplo."
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Desabilita leitura/gravação de cache."
+    )
+    parser.add_argument(
+        "--judge-model",
+        type=str,
+        default="",
+        help="Override de EVAL_MODEL para o judge (ex: gpt-4o-mini)."
+    )
+    parser.add_argument(
+        "--final-run",
+        action="store_true",
+        help="Força avaliação completa (15 exemplos, métricas completas)."
+    )
+    return parser.parse_args()
+
+
+def load_cache(cache_file: str) -> Dict[str, Any]:
+    """Carrega cache do disco; retorna estrutura padrão se não existir."""
+    cache_path = Path(cache_file)
+    if not cache_path.exists():
+        return {"version": 1, "entries": {}}
+
+    try:
+        with open(cache_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict) or "entries" not in data:
+            return {"version": 1, "entries": {}}
+        return data
+    except Exception:
+        return {"version": 1, "entries": {}}
+
+
+def save_cache(cache_file: str, cache_data: Dict[str, Any]) -> None:
+    """Persiste cache no disco."""
+    cache_path = Path(cache_file)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(cache_path, "w", encoding="utf-8") as f:
+        json.dump(cache_data, f, ensure_ascii=False, indent=2)
+
+
+def _safe_json_dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def build_example_cache_key(prompt_name: str, prompt_fingerprint: str, example: Any) -> str:
+    """Gera chave de cache estável por prompt+conteúdo do exemplo."""
+    inputs = example.inputs if hasattr(example, "inputs") else {}
+    outputs = example.outputs if hasattr(example, "outputs") else {}
+    payload = "|".join([
+        prompt_name,
+        prompt_fingerprint,
+        _safe_json_dumps(inputs),
+        _safe_json_dumps(outputs),
+    ])
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def invoke_chain_with_throttle(chain, inputs):
+    """Invoca chain com throttling para respeitar rate limits do Gemini free tier."""
+    global _LAST_GEN_CALL_TS
+
+    provider = os.getenv("LLM_PROVIDER", "openai").lower()
+    min_interval = 0.0
+    if provider in ["google", "gemini"]:
+        min_interval = float(os.getenv("GEMINI_MIN_INTERVAL_SEC", "3.0"))
+
+    now = time.time()
+    wait = min_interval - (now - _LAST_GEN_CALL_TS)
+    if wait > 0:
+        time.sleep(wait)
+
+    retries = 3
+    for attempt in range(retries):
+        try:
+            response = chain.invoke(inputs)
+            _LAST_GEN_CALL_TS = time.time()
+            return response
+        except Exception as e:
+            error_text = str(e).lower()
+            is_rate_limit = "429" in error_text or "quota" in error_text or "resource_exhausted" in error_text
+            if is_rate_limit and attempt < retries - 1:
+                time.sleep(15)
+                continue
+            raise
 
 
 def get_llm():
@@ -151,7 +266,7 @@ def evaluate_prompt_on_example(
 
         chain = prompt_template | llm
 
-        response = chain.invoke(inputs)
+        response = invoke_chain_with_throttle(chain, inputs)
         answer = response.content
 
         reference = outputs.get("reference", "") if isinstance(outputs, dict) else ""
@@ -181,7 +296,11 @@ def evaluate_prompt_on_example(
 def evaluate_prompt(
     prompt_name: str,
     dataset_name: str,
-    client: Client
+    client: Client,
+    selected_metrics: set,
+    max_examples: int,
+    cache_data: Dict[str, Any],
+    use_cache: bool
 ) -> Dict[str, float]:
     print(f"\n🔍 Avaliando: {prompt_name}")
 
@@ -189,7 +308,12 @@ def evaluate_prompt(
         prompt_template = pull_prompt_from_langsmith(prompt_name)
 
         examples = list(client.list_examples(dataset_name=dataset_name))
-        print(f"   Dataset: {len(examples)} exemplos")
+        total_examples = len(examples)
+
+        if max_examples > 0:
+            examples = examples[:max_examples]
+
+        print(f"   Dataset: {len(examples)} exemplos (total: {total_examples})")
 
         llm = get_llm()
 
@@ -197,28 +321,76 @@ def evaluate_prompt(
         clarity_scores = []
         precision_scores = []
 
+        prompt_fingerprint = hashlib.sha256(str(prompt_template).encode("utf-8")).hexdigest()[:16]
+        cache_hits = 0
+
         print("   Avaliando exemplos...")
 
         for i, example in enumerate(examples, 1):
-            result = evaluate_prompt_on_example(prompt_template, example, llm)
+            cache_key = build_example_cache_key(prompt_name, prompt_fingerprint, example)
+            cached = cache_data.get("entries", {}).get(cache_key, {}) if use_cache else {}
+
+            if cached.get("answer"):
+                result = {
+                    "answer": cached.get("answer", ""),
+                    "reference": cached.get("reference", ""),
+                    "question": cached.get("question", "")
+                }
+                cache_hits += 1
+            else:
+                result = evaluate_prompt_on_example(prompt_template, example, llm)
 
             if result["answer"]:
-                f1 = evaluate_f1_score(result["question"], result["answer"], result["reference"])
-                clarity = evaluate_clarity(result["question"], result["answer"], result["reference"])
-                precision = evaluate_precision(result["question"], result["answer"], result["reference"])
+                f1_score = cached.get("f1_score") if use_cache else None
+                clarity_score = cached.get("clarity") if use_cache else None
+                precision_score = cached.get("precision") if use_cache else None
 
-                f1_scores.append(f1["score"])
-                clarity_scores.append(clarity["score"])
-                precision_scores.append(precision["score"])
+                if "f1" in selected_metrics and f1_score is None:
+                    f1 = evaluate_f1_score(result["question"], result["answer"], result["reference"])
+                    f1_score = f1["score"]
 
-                print(f"      [{i}/{len(examples)}] F1:{f1['score']:.2f} Clarity:{clarity['score']:.2f} Precision:{precision['score']:.2f}")
+                if "clarity" in selected_metrics and clarity_score is None:
+                    clarity = evaluate_clarity(result["question"], result["answer"], result["reference"])
+                    clarity_score = clarity["score"]
 
-        avg_f1 = sum(f1_scores) / len(f1_scores) if f1_scores else 0.0
-        avg_clarity = sum(clarity_scores) / len(clarity_scores) if clarity_scores else 0.0
-        avg_precision = sum(precision_scores) / len(precision_scores) if precision_scores else 0.0
+                if "precision" in selected_metrics and precision_score is None:
+                    precision = evaluate_precision(result["question"], result["answer"], result["reference"])
+                    precision_score = precision["score"]
 
-        avg_helpfulness = (avg_clarity + avg_precision) / 2
-        avg_correctness = (avg_f1 + avg_precision) / 2
+                if "f1" in selected_metrics and f1_score is not None:
+                    f1_scores.append(float(f1_score))
+
+                if "clarity" in selected_metrics and clarity_score is not None:
+                    clarity_scores.append(float(clarity_score))
+
+                if "precision" in selected_metrics and precision_score is not None:
+                    precision_scores.append(float(precision_score))
+
+                if use_cache:
+                    cache_data.setdefault("entries", {})[cache_key] = {
+                        "answer": result["answer"],
+                        "reference": result["reference"],
+                        "question": result["question"],
+                        "f1_score": f1_score,
+                        "clarity": clarity_score,
+                        "precision": precision_score,
+                        "updated_at": int(time.time())
+                    }
+
+                f1_print = f"{float(f1_score):.2f}" if f1_score is not None else "-"
+                clarity_print = f"{float(clarity_score):.2f}" if clarity_score is not None else "-"
+                precision_print = f"{float(precision_score):.2f}" if precision_score is not None else "-"
+                print(f"      [{i}/{len(examples)}] F1:{f1_print} Clarity:{clarity_print} Precision:{precision_print}")
+
+        avg_f1 = sum(f1_scores) / len(f1_scores) if "f1" in selected_metrics and f1_scores else 0.0
+        avg_clarity = sum(clarity_scores) / len(clarity_scores) if "clarity" in selected_metrics and clarity_scores else 0.0
+        avg_precision = sum(precision_scores) / len(precision_scores) if "precision" in selected_metrics and precision_scores else 0.0
+
+        avg_helpfulness = (avg_clarity + avg_precision) / 2 if {"clarity", "precision"}.issubset(selected_metrics) else 0.0
+        avg_correctness = (avg_f1 + avg_precision) / 2 if {"f1", "precision"}.issubset(selected_metrics) else 0.0
+
+        if use_cache:
+            print(f"   Cache hit (geração/score): {cache_hits}/{len(examples)}")
 
         return {
             "helpfulness": round(avg_helpfulness, 4),
@@ -253,28 +425,68 @@ def display_results(prompt_name: str, scores: Dict[str, float]) -> bool:
     print(f"  - Clarity: {format_score(scores['clarity'], threshold=0.9)}")
     print(f"  - Precision: {format_score(scores['precision'], threshold=0.9)}")
 
-    average_score = sum(scores.values()) / len(scores)
+    selected_base = scores.get("selected_base_metrics", ["f1", "clarity", "precision"])
+    is_full_run = set(selected_base) == {"f1", "clarity", "precision"}
+
+    if is_full_run:
+        full_keys = ["helpfulness", "correctness", "f1_score", "clarity", "precision"]
+        average_score = sum(scores[k] for k in full_keys) / len(full_keys)
+    else:
+        values = []
+        if "f1" in selected_base:
+            values.append(scores["f1_score"])
+        if "clarity" in selected_base:
+            values.append(scores["clarity"])
+        if "precision" in selected_base:
+            values.append(scores["precision"])
+        average_score = sum(values) / len(values) if values else 0.0
 
     print("\n" + "-" * 50)
     print(f"📊 MÉDIA GERAL: {average_score:.4f}")
     print("-" * 50)
 
-    all_above_threshold = all(score >= 0.9 for score in scores.values())
-    passed = all_above_threshold and average_score >= 0.9
+    if is_full_run:
+        all_above_threshold = all(score >= 0.9 for key, score in scores.items() if key in ["helpfulness", "correctness", "f1_score", "clarity", "precision"])
+        passed = all_above_threshold and average_score >= 0.9
+    else:
+        all_above_threshold = False
+        passed = False
 
     if passed:
         print(f"\n✅ STATUS: APROVADO - Todas as métricas >= 0.9")
     else:
-        print(f"\n❌ STATUS: REPROVADO")
-        failed_metrics = [name for name, score in scores.items() if score < 0.9]
-        if failed_metrics:
-            print(f"⚠️  Métricas abaixo de 0.9: {', '.join(failed_metrics)}")
-        print(f"⚠️  Média atual: {average_score:.4f} | Necessário: 0.9000")
+        if is_full_run:
+            print(f"\n❌ STATUS: REPROVADO")
+            failed_metrics = [name for name, score in scores.items() if name in ["helpfulness", "correctness", "f1_score", "clarity", "precision"] and score < 0.9]
+            if failed_metrics:
+                print(f"⚠️  Métricas abaixo de 0.9: {', '.join(failed_metrics)}")
+            print(f"⚠️  Média atual: {average_score:.4f} | Necessário: 0.9000")
+        else:
+            print("\nℹ️  STATUS: ITERAÇÃO PARCIAL (modo econômico)")
+            print(f"ℹ️  Métricas avaliadas nesta rodada: {', '.join(selected_base)}")
+            print("ℹ️  Use --final-run para validar aprovação oficial com todas as métricas")
 
     return passed
 
 
 def main():
+    args = parse_args()
+
+    if args.judge_model:
+        os.environ["EVAL_MODEL"] = args.judge_model
+
+    selected_metrics = {m.strip().lower() for m in args.metrics.split(",") if m.strip()}
+    valid_metrics = {"f1", "clarity", "precision"}
+    selected_metrics = selected_metrics.intersection(valid_metrics)
+    if not selected_metrics:
+        selected_metrics = {"f1", "clarity", "precision"}
+
+    max_examples = max(0, args.max_examples)
+
+    if args.final_run:
+        selected_metrics = {"f1", "clarity", "precision"}
+        max_examples = 0
+
     print_section_header("AVALIAÇÃO DE PROMPTS OTIMIZADOS")
 
     provider = os.getenv("LLM_PROVIDER", "openai")
@@ -284,6 +496,9 @@ def main():
     print(f"Provider: {provider}")
     print(f"Modelo Principal: {llm_model}")
     print(f"Modelo de Avaliação: {eval_model}\n")
+    print(f"Métricas base selecionadas: {', '.join(sorted(selected_metrics))}")
+    print(f"Limite de exemplos: {'todos' if max_examples == 0 else max_examples}")
+    print(f"Cache: {'desabilitado' if args.no_cache else args.cache_file}\n")
 
     required_vars = ["LANGSMITH_API_KEY", "LLM_PROVIDER"]
     if provider == "openai":
@@ -307,6 +522,11 @@ def main():
     dataset_name = f"{project_name}-eval"
     create_evaluation_dataset(client, dataset_name, jsonl_path)
 
+    cache_data = {"version": 1, "entries": {}}
+    use_cache = not args.no_cache
+    if use_cache:
+        cache_data = load_cache(args.cache_file)
+
     print("\n" + "=" * 70)
     print("PROMPTS PARA AVALIAR")
     print("=" * 70)
@@ -314,15 +534,16 @@ def main():
     print("Certifique-se de ter feito push dos prompts antes de avaliar:")
     print("  python src/push_prompts.py\n")
 
-    username = os.getenv("USERNAME_LANGSMITH_HUB", "")
-    if not username:
-        print("❌ USERNAME_LANGSMITH_HUB não configurada no .env")
-        print("   Configure seu username do LangSmith Hub antes de continuar.")
-        return 1
-
-    prompts_to_evaluate = [
-        f"{username}/bug_to_user_story_v2",
-    ]
+    username = os.getenv("USERNAME_LANGSMITH_HUB", "").strip()
+    if username:
+        prompts_to_evaluate = [
+            f"{username}/bug_to_user_story_v2",
+        ]
+    else:
+        print("⚠️  USERNAME_LANGSMITH_HUB não configurada; tentando nome sem owner explícito")
+        prompts_to_evaluate = [
+            "bug_to_user_story_v2",
+        ]
 
     all_passed = True
     evaluated_count = 0
@@ -332,7 +553,16 @@ def main():
         evaluated_count += 1
 
         try:
-            scores = evaluate_prompt(prompt_name, dataset_name, client)
+            scores = evaluate_prompt(
+                prompt_name,
+                dataset_name,
+                client,
+                selected_metrics=selected_metrics,
+                max_examples=max_examples,
+                cache_data=cache_data,
+                use_cache=use_cache
+            )
+            scores["selected_base_metrics"] = sorted(list(selected_metrics))
 
             passed = display_results(prompt_name, scores)
             all_passed = all_passed and passed
@@ -371,7 +601,11 @@ def main():
     print(f"Aprovados: {sum(1 for r in results_summary if r['passed'])}")
     print(f"Reprovados: {sum(1 for r in results_summary if not r['passed'])}\n")
 
-    if all_passed:
+    if use_cache:
+        save_cache(args.cache_file, cache_data)
+        print(f"Cache salvo em: {args.cache_file}\n")
+
+    if all_passed and set(selected_metrics) == {"f1", "clarity", "precision"}:
         print("✅ Todos os prompts atingiram todas as métricas >= 0.9!")
         print(f"\n✓ Confira os resultados em:")
         print(f"  https://smith.langchain.com/projects/{project_name}")
@@ -379,6 +613,13 @@ def main():
         print("1. Documente o processo no README.md")
         print("2. Capture screenshots das avaliações")
         print("3. Faça commit e push para o GitHub")
+        return 0
+    elif set(selected_metrics) != {"f1", "clarity", "precision"}:
+        print("ℹ️  Rodada parcial concluída (modo econômico)")
+        print("\nPróximos passos:")
+        print("1. Ajuste o prompt conforme os scores desta rodada")
+        print("2. Reavalie com cache para reduzir custo")
+        print("3. Execute rodada oficial: python src/evaluate.py --final-run")
         return 0
     else:
         print("⚠️  Alguns prompts não atingiram todas as métricas >= 0.9")

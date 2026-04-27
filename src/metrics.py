@@ -24,12 +24,45 @@ Configure o provider no arquivo .env através da variável LLM_PROVIDER.
 import os
 import json
 import re
+import time
 from typing import Dict, Any
 from dotenv import load_dotenv
 from langchain_core.messages import SystemMessage, HumanMessage
 from utils import get_eval_llm
 
 load_dotenv()
+
+_LAST_EVAL_CALL_TS = 0.0
+
+
+def _invoke_with_throttle(llm, messages):
+    """Invoca LLM com throttling para respeitar rate limits do Gemini free tier."""
+    global _LAST_EVAL_CALL_TS
+
+    provider = os.getenv("LLM_PROVIDER", "openai").lower()
+    min_interval = 0.0
+    if provider in ["google", "gemini"]:
+        min_interval = float(os.getenv("GEMINI_MIN_INTERVAL_SEC", "3.0"))
+
+    now = time.time()
+    wait = min_interval - (now - _LAST_EVAL_CALL_TS)
+    if wait > 0:
+        time.sleep(wait)
+
+    retries = 3
+    for attempt in range(retries):
+        try:
+            response = llm.invoke(messages)
+            _LAST_EVAL_CALL_TS = time.time()
+            return response
+        except Exception as e:
+            error_text = str(e).lower()
+            is_rate_limit = "429" in error_text or "quota" in error_text or "resource_exhausted" in error_text
+
+            if is_rate_limit and attempt < retries - 1:
+                time.sleep(15)
+                continue
+            raise
 
 
 def get_evaluator_llm():
@@ -128,7 +161,7 @@ NÃO adicione nenhum texto antes ou depois do JSON.
 
     try:
         llm = get_evaluator_llm()
-        response = llm.invoke([HumanMessage(content=evaluator_prompt)])
+        response = _invoke_with_throttle(llm, [HumanMessage(content=evaluator_prompt)])
         result = extract_json_from_response(response.content)
 
         precision = float(result.get("precision", 0.0))
@@ -225,7 +258,7 @@ NÃO adicione nenhum texto antes ou depois do JSON.
 
     try:
         llm = get_evaluator_llm()
-        response = llm.invoke([HumanMessage(content=evaluator_prompt)])
+        response = _invoke_with_throttle(llm, [HumanMessage(content=evaluator_prompt)])
         result = extract_json_from_response(response.content)
 
         score = float(result.get("score", 0.0))
@@ -312,7 +345,7 @@ NÃO adicione nenhum texto antes ou depois do JSON.
 
     try:
         llm = get_evaluator_llm()
-        response = llm.invoke([HumanMessage(content=evaluator_prompt)])
+        response = _invoke_with_throttle(llm, [HumanMessage(content=evaluator_prompt)])
         result = extract_json_from_response(response.content)
 
         score = float(result.get("score", 0.0))
