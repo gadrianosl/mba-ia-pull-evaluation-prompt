@@ -33,6 +33,17 @@ from utils import get_eval_llm
 load_dotenv()
 
 _LAST_EVAL_CALL_TS = 0.0
+def extract_retry_delay_from_error(error_message: str) -> float:
+    """Extrai o tempo de retry sugerido pelo Gemini API da mensagem de erro."""
+    match = re.search(r'retry in ([\d.]+)s', error_message, re.IGNORECASE)
+    if match:
+        try:
+            return float(match.group(1)) + 2.0
+        except ValueError:
+            pass
+    return None
+
+
 
 
 def _invoke_with_throttle(llm, messages):
@@ -49,18 +60,26 @@ def _invoke_with_throttle(llm, messages):
     if wait > 0:
         time.sleep(wait)
 
-    retries = 3
+    retries = 5
     for attempt in range(retries):
         try:
             response = llm.invoke(messages)
             _LAST_EVAL_CALL_TS = time.time()
             return response
         except Exception as e:
-            error_text = str(e).lower()
-            is_rate_limit = "429" in error_text or "quota" in error_text or "resource_exhausted" in error_text
+            error_text = str(e)
+            error_text_lower = error_text.lower()
+            is_rate_limit = "429" in error_text or "quota" in error_text_lower or "resource_exhausted" in error_text_lower
 
             if is_rate_limit and attempt < retries - 1:
-                time.sleep(15)
+                suggested_delay = extract_retry_delay_from_error(error_text)
+                if suggested_delay:
+                    wait_time = suggested_delay
+                    print(f"      ⏳ Quota límite atingido. Aguardando {wait_time:.1f}s...")
+                else:
+                    wait_time = min(15 * (2 ** attempt), 120)
+                    print(f"      ⏳ Rate limit. Aguardando {wait_time:.1f}s (tentativa {attempt + 1}/{retries})...")
+                time.sleep(wait_time)
                 continue
             raise
 

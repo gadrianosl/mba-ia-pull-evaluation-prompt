@@ -19,6 +19,7 @@ Configure o provider no arquivo .env através da variável LLM_PROVIDER.
 
 import os
 import sys
+import re
 import json
 import time
 import hashlib
@@ -74,6 +75,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Força avaliação completa (15 exemplos, métricas completas)."
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Pula exemplos já presentes no cache (matching por outputs.reference)."
+    )
+    parser.add_argument(
+        "--rerun-examples",
+        type=str,
+        default="",
+        help="Lista de números de exemplos para forçar rerun, ex: 5,15."
+    )
     return parser.parse_args()
 
 
@@ -105,6 +117,58 @@ def _safe_json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
 
 
+def _get_example_payload(example: Any, field_name: str, default: Any = None) -> Any:
+    if hasattr(example, field_name):
+        return getattr(example, field_name)
+    if isinstance(example, dict):
+        return example.get(field_name, default)
+    return default
+
+
+def _load_resume_index_from_status(status_path: str = "EVALUATION_STATUS.md") -> int:
+    status_file = Path(status_path)
+    if not status_file.exists():
+        return 0
+
+    try:
+        content = status_file.read_text(encoding="utf-8")
+    except Exception:
+        return 0
+
+    patterns = [
+        r"progresso confirmado ate o item\s+(\d+)",
+        r"progresso ate o item\s+(\d+)",
+        r"progresso ate\s+(\d+)/\d+",
+    ]
+
+    for pattern in patterns:
+        matches = re.findall(pattern, content, flags=re.IGNORECASE)
+        if matches:
+            try:
+                return max(int(value) for value in matches)
+            except ValueError:
+                continue
+
+    return 0
+
+
+def _parse_rerun_examples(raw_value: str) -> set[int]:
+    rerun_examples = set()
+    if not raw_value:
+        return rerun_examples
+
+    for item in raw_value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            rerun_examples.add(int(item))
+        except ValueError:
+            continue
+
+    return rerun_examples
+
+
 def build_example_cache_key(prompt_name: str, prompt_fingerprint: str, example: Any) -> str:
     """Gera chave de cache estável por prompt+conteúdo do exemplo."""
     inputs = example.inputs if hasattr(example, "inputs") else {}
@@ -116,6 +180,18 @@ def build_example_cache_key(prompt_name: str, prompt_fingerprint: str, example: 
         _safe_json_dumps(outputs),
     ])
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def extract_retry_delay_from_error(error_message: str) -> float:
+    """Extrai o tempo de retry sugerido pelo Gemini API da mensagem de erro."""
+    # Procura por "retry in X.XXXs" ou "Please retry in X.XXXs"
+    match = re.search(r'retry in ([\d.]+)s', error_message, re.IGNORECASE)
+    if match:
+        try:
+            return float(match.group(1)) + 2.0  # Add buffer
+        except ValueError:
+            pass
+    return None
 
 
 def invoke_chain_with_throttle(chain, inputs):
@@ -132,18 +208,35 @@ def invoke_chain_with_throttle(chain, inputs):
     if wait > 0:
         time.sleep(wait)
 
-    retries = 3
+    retries = 5
     for attempt in range(retries):
         try:
             response = chain.invoke(inputs)
             _LAST_GEN_CALL_TS = time.time()
             return response
         except Exception as e:
-            error_text = str(e).lower()
-            is_rate_limit = "429" in error_text or "quota" in error_text or "resource_exhausted" in error_text
+            error_text = str(e)
+            error_text_lower = error_text.lower()
+            
+            is_rate_limit = "429" in error_text or "quota" in error_text_lower or "resource_exhausted" in error_text_lower
+            
             if is_rate_limit and attempt < retries - 1:
-                time.sleep(15)
+                # Tenta extrair o delay sugerido pelo Gemini
+                suggested_delay = extract_retry_delay_from_error(error_text)
+                
+                if suggested_delay:
+                    wait_time = suggested_delay
+                    print(f"      ⏳ Quota límite atingido. Aguardando {wait_time:.1f}s conforme sugerido pela API...")
+                else:
+                    # Fallback: exponential backoff começando em 15s
+                    wait_time = 15 * (2 ** attempt)
+                    max_wait = 120  # máximo 2 minutos
+                    wait_time = min(wait_time, max_wait)
+                    print(f"      ⏳ Rate limit detectado. Aguardando {wait_time:.1f}s (tentativa {attempt + 1}/{retries})...")
+                
+                time.sleep(wait_time)
                 continue
+            
             raise
 
 
@@ -261,8 +354,8 @@ def evaluate_prompt_on_example(
     llm: Any
 ) -> Dict[str, Any]:
     try:
-        inputs = example.inputs if hasattr(example, 'inputs') else {}
-        outputs = example.outputs if hasattr(example, 'outputs') else {}
+        inputs = _get_example_payload(example, "inputs", {})
+        outputs = _get_example_payload(example, "outputs", {})
 
         chain = prompt_template | llm
 
@@ -300,7 +393,9 @@ def evaluate_prompt(
     selected_metrics: set,
     max_examples: int,
     cache_data: Dict[str, Any],
-    use_cache: bool
+    use_cache: bool,
+    resume: bool = False,
+    rerun_examples: set[int] | None = None
 ) -> Dict[str, float]:
     print(f"\n🔍 Avaliando: {prompt_name}")
 
@@ -323,12 +418,46 @@ def evaluate_prompt(
 
         prompt_fingerprint = hashlib.sha256(str(prompt_template).encode("utf-8")).hexdigest()[:16]
         cache_hits = 0
+        resume_from_index = _load_resume_index_from_status() if resume else 0
+        rerun_examples = rerun_examples or set()
+
+        # If resume is requested, build a quick lookup of cached references
+        cached_references = set()
+        if resume and use_cache:
+            for v in cache_data.get("entries", {}).values():
+                ref = v.get("reference", "")
+                if ref:
+                    cached_references.add(ref.strip())
 
         print("   Avaliando exemplos...")
 
         for i, example in enumerate(examples, 1):
+            force_rerun = i in rerun_examples
+
+            if resume and resume_from_index and i <= resume_from_index:
+                if force_rerun:
+                    print(f"      [{i}/{len(examples)}] RERUN (override do checkpoint)")
+                else:
+                    print(f"      [{i}/{len(examples)}] SKIP (checkpoint de status)")
+                    cache_hits += 1
+                    continue
+
+            # Optionally skip examples already present in cache by matching reference
+            if resume and use_cache and not force_rerun:
+                example_outputs = _get_example_payload(example, "outputs", {})
+                example_ref = ""
+                if isinstance(example_outputs, dict):
+                    example_ref = example_outputs.get("reference", "")
+                elif hasattr(example_outputs, "get"):
+                    example_ref = example_outputs.get("reference", "")
+                example_ref = str(example_ref).strip()
+
+                if example_ref and example_ref in cached_references:
+                    print(f"      [{i}/{len(examples)}] SKIP (cached by reference)")
+                    cache_hits += 1
+                    continue
             cache_key = build_example_cache_key(prompt_name, prompt_fingerprint, example)
-            cached = cache_data.get("entries", {}).get(cache_key, {}) if use_cache else {}
+            cached = cache_data.get("entries", {}).get(cache_key, {}) if use_cache and not force_rerun else {}
 
             if cached.get("answer"):
                 result = {
@@ -560,7 +689,9 @@ def main():
                 selected_metrics=selected_metrics,
                 max_examples=max_examples,
                 cache_data=cache_data,
-                use_cache=use_cache
+                use_cache=use_cache,
+                resume=args.resume,
+                rerun_examples=_parse_rerun_examples(args.rerun_examples)
             )
             scores["selected_base_metrics"] = sorted(list(selected_metrics))
 
